@@ -11,8 +11,6 @@ if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
 from transformers import AutoProcessor, Florence2ForConditionalGeneration
-from iopaint.model_manager import ModelManager
-from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import torch
 from torch.nn import Module
 import tqdm
@@ -51,6 +49,8 @@ def download_lama_model():
 
 def load_lama_model(device):
     """Load LaMA model, downloading if necessary."""
+    from iopaint.model_manager import ModelManager
+
     try:
         return ModelManager(name="lama", device=device)
     except NotImplementedError as e:
@@ -126,6 +126,215 @@ def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration,
     return mask
 
 
+def get_heygen_local_mask(image: Image.Image):
+    """
+    Build a pixel-level mask for repeated translucent HeyGen watermarks.
+
+    HeyGen marks are usually pale, low-saturation text/logo strokes over the
+    image. A local-brightness residual catches those strokes better than the
+    generic Florence bounding-box detector, and avoids masking whole face/torso
+    rectangles before LaMA inpainting.
+    """
+    rgb = np.array(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=11, sigmaY=11)
+    bright_residual = cv2.subtract(gray, background)
+
+    local_candidate = (
+        (bright_residual > 7) &
+        (saturation < 95) &
+        (value > 95)
+    ).astype(np.uint8) * 255
+
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(local_candidate, cv2.MORPH_OPEN, kernel_open)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    filtered = np.zeros_like(mask)
+    image_area = mask.shape[0] * mask.shape[1]
+    max_component_area = max(3000, int(image_area * 0.018))
+
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        if area < 5 or area > max_component_area:
+            continue
+        if w > image.width * 0.75 or h > image.height * 0.35:
+            continue
+        filtered[labels == label] = 255
+
+    kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    filtered = cv2.dilate(filtered, kernel_dilate, iterations=1)
+    return Image.fromarray(filtered)
+
+
+def _extract_heygen_template(image: Image.Image):
+    rgb = np.array(image.convert("RGB"))
+    height, width = rgb.shape[:2]
+
+    x0 = int(width * 0.132)
+    y0 = int(height * 0.094)
+    template_width = max(80, int(width * 0.264))
+    template_height = max(60, int(height * 0.113))
+
+    if x0 + template_width > width or y0 + template_height > height:
+        return None
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=11, sigmaY=11)
+    residual = cv2.subtract(gray, background)
+
+    stroke = (
+        (residual > 4) &
+        (hsv[:, :, 1] < 145) &
+        (hsv[:, :, 2] > 60)
+    ).astype(np.uint8) * 255
+    stroke = cv2.morphologyEx(stroke, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)))
+
+    template_mask = stroke[y0:y0 + template_height, x0:x0 + template_width]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(template_mask, 8)
+    filtered = np.zeros_like(template_mask)
+    max_area = max(800, int(template_width * template_height * 0.25))
+
+    for label in range(1, num_labels):
+        _, _, _, _, area = stats[label]
+        if 5 <= area <= max_area:
+            filtered[labels == label] = 255
+
+    if np.count_nonzero(filtered) < template_width * template_height * 0.015:
+        return None
+
+    gray_float = gray.astype(np.float32)
+    background_float = cv2.GaussianBlur(gray_float, (0, 0), sigmaX=17, sigmaY=17)
+    alpha = np.clip(
+        np.maximum(gray_float - background_float, 0) / np.maximum(255 - background_float, 1),
+        0,
+        0.45
+    )
+    template_alpha = alpha[y0:y0 + template_height, x0:x0 + template_width] * (filtered > 0)
+    template_alpha = cv2.GaussianBlur(template_alpha, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    template_alpha = np.where(template_alpha > 0.015, template_alpha, 0)
+
+    template_mask = cv2.dilate(filtered, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+    return {
+        "x0": x0,
+        "y0": y0,
+        "step_x": max(1, int(width * 0.389)),
+        "step_y": max(1, int(height * 0.219)),
+        "mask": template_mask,
+        "alpha": template_alpha,
+    }
+
+
+def build_heygen_template_maps(image: Image.Image, alpha_gain: float = 1.5):
+    template = _extract_heygen_template(image)
+    if template is None:
+        mask = np.array(get_heygen_local_mask(image))
+        alpha = (cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigmaX=1.2, sigmaY=1.2) * 0.18)
+        return Image.fromarray(mask), alpha
+
+    width, height = image.size
+    template_mask = template["mask"]
+    template_alpha = template["alpha"] * alpha_gain
+    template_height, template_width = template_mask.shape
+    full_mask = np.zeros((height, width), np.uint8)
+    full_alpha = np.zeros((height, width), np.float32)
+
+    for y in range(template["y0"] - template["step_y"], height + template["step_y"], template["step_y"]):
+        for x in range(template["x0"] - (2 * template["step_x"]), width + template["step_x"], template["step_x"]):
+            vx1, vy1 = max(0, x), max(0, y)
+            vx2, vy2 = min(width, x + template_width), min(height, y + template_height)
+            if vx2 <= vx1 or vy2 <= vy1:
+                continue
+            if (vx2 - vx1) * (vy2 - vy1) < template_width * template_height * 0.18:
+                continue
+
+            sx1, sy1 = vx1 - x, vy1 - y
+            sx2, sy2 = sx1 + (vx2 - vx1), sy1 + (vy2 - vy1)
+            full_mask[vy1:vy2, vx1:vx2] = np.maximum(
+                full_mask[vy1:vy2, vx1:vx2],
+                template_mask[sy1:sy2, sx1:sx2]
+            )
+            full_alpha[vy1:vy2, vx1:vx2] = np.maximum(
+                full_alpha[vy1:vy2, vx1:vx2],
+                template_alpha[sy1:sy2, sx1:sx2]
+            )
+
+    full_alpha = np.clip(full_alpha, 0, 0.42)
+    return Image.fromarray(full_mask), full_alpha
+
+
+def get_heygen_mask(image: Image.Image):
+    mask, _ = build_heygen_template_maps(image)
+    return mask
+
+
+def remove_heygen_watermark(image: Image.Image, alpha_map: np.ndarray = None, mask_image: Image.Image = None):
+    if alpha_map is None:
+        mask, alpha_map = build_heygen_template_maps(image)
+    elif mask_image is not None:
+        mask = mask_image
+    else:
+        mask = Image.fromarray((alpha_map > 0).astype(np.uint8) * 255)
+
+    rgb = np.array(image.convert("RGB")).astype(np.float32)
+    height, _ = rgb.shape[:2]
+    alpha = np.clip(alpha_map, 0, 0.42)
+    deblended = (rgb - 255 * alpha[:, :, None]) / np.maximum(1 - alpha[:, :, None], 0.2)
+    deblended = np.clip(deblended, 0, 255).astype(np.uint8)
+
+    mask_array = np.maximum(
+        np.array(mask.convert("L")),
+        (alpha > 0.003).astype(np.uint8) * 255
+    )
+    mask_array = cv2.dilate(
+        mask_array,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1
+    )
+    if np.count_nonzero(mask_array) == 0:
+        return Image.fromarray(deblended)
+
+    telea = cv2.inpaint(
+        cv2.cvtColor(deblended, cv2.COLOR_RGB2BGR),
+        mask_array,
+        2,
+        cv2.INPAINT_TELEA
+    )
+    telea = cv2.cvtColor(telea, cv2.COLOR_BGR2RGB).astype(np.float32)
+    repair_alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    y_coords = np.arange(height)[:, None]
+    low_risk_surface = (
+        (saturation < 55) |
+        ((value > 175) & (saturation < 95)) |
+        ((y_coords < height * 0.25) & (saturation < 125))
+    ).astype(np.float32)
+    low_risk_surface = cv2.GaussianBlur(low_risk_surface, (0, 0), sigmaX=1.2, sigmaY=1.2)
+    mask_feather = cv2.GaussianBlur((mask_array > 0).astype(np.float32), (0, 0), sigmaX=0.8, sigmaY=0.8)
+    repair_alpha = np.maximum(repair_alpha, mask_feather * low_risk_surface * 0.10)
+    blend_weight = np.clip(repair_alpha / 0.22, 0, 1) ** 1.25
+    clean = (
+        deblended.astype(np.float32) * (1 - blend_weight[:, :, None]) +
+        telea * blend_weight[:, :, None]
+    )
+    return Image.fromarray(np.clip(clean, 0, 255).astype(np.uint8))
+
+
+def get_mask(image: Image.Image, mask_mode: str, model: Florence2ForConditionalGeneration = None, processor: AutoProcessor = None, device: str = "cpu", max_bbox_percent: float = 10.0, detection_prompt: str = "watermark", heygen_mask: Image.Image = None):
+    if mask_mode == "heygen":
+        return heygen_mask if heygen_mask is not None else get_heygen_mask(image)
+    return get_watermark_mask(image, model, processor, device, max_bbox_percent, detection_prompt)
+
+
 def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
     """
     Detect watermarks and return bounding boxes WITHOUT creating mask or inpainting.
@@ -156,7 +365,32 @@ def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, proces
 
     return results
 
-def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelManager):
+
+def preview_heygen_mask(image: Image.Image):
+    mask = get_heygen_mask(image)
+    mask_array = np.array(mask)
+    overlay = image.convert("RGBA")
+    red = Image.new("RGBA", overlay.size, (255, 0, 80, 105))
+    clear = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+    overlay.alpha_composite(Image.composite(red, clear, mask))
+
+    covered_pixels = int(np.count_nonzero(mask_array))
+    area_percent = round((covered_pixels / mask_array.size) * 100, 2) if mask_array.size else 0
+    detections = []
+    if covered_pixels:
+        detections.append({
+            "bbox": [0, 0, image.width, image.height],
+            "area_percent": area_percent,
+            "accepted": True,
+            "mode": "heygen"
+        })
+
+    return overlay.convert("RGB"), detections
+
+
+def process_image_with_lama(image: MatLike, mask: MatLike, model_manager):
+    from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
+
     config = Config(
         ldm_steps=50,
         ldm_sampler=LDMSampler.ddim,
@@ -189,7 +423,7 @@ def is_video_file(file_path):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
     return Path(file_path).suffix.lower() in video_extensions
 
-def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", progress_offset=0, progress_scale=100):
+def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", mask_mode="florence", progress_offset=0, progress_scale=100):
     """Process a video file by extracting frames, removing watermarks, and reconstructing the video"""
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -228,6 +462,16 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to MP4
     
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
+
+    heygen_mask = None
+    heygen_alpha = None
+    if mask_mode == "heygen":
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 2)
+        ret, reference_frame = cap.read()
+        if ret:
+            reference_image = Image.fromarray(cv2.cvtColor(reference_frame, cv2.COLOR_BGR2RGB))
+            heygen_mask, heygen_alpha = build_heygen_template_maps(reference_image)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     # Process each frame
     with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
@@ -242,7 +486,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             pil_image = Image.fromarray(frame_rgb)
             
             # Get watermark mask
-            mask_image = get_watermark_mask(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+            mask_image = get_mask(pil_image, mask_mode, florence_model, florence_processor, device, max_bbox_percent, detection_prompt, heygen_mask)
             
             # Process frame
             if transparent:
@@ -252,6 +496,8 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 background = Image.new("RGB", result_image.size, (255, 255, 255))
                 background.paste(result_image, mask=result_image.split()[3])
                 result_image = background
+            elif mask_mode == "heygen":
+                result_image = remove_heygen_watermark(pil_image, heygen_alpha, heygen_mask)
             else:
                 lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
                 result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
@@ -287,7 +533,11 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),  # Processed video without audio
                 "-i", str(input_path),       # Original video with audio
-                "-c:v", "copy",              # Copy video without re-encoding
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 "-c:a", "aac",               # Encode audio as AAC for better compatibility
                 "-map", "0:v:0",             # Use video track from first file (processed video)
                 "-map", "1:a:0",             # Use audio track from second file (original video)
@@ -315,7 +565,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     return output_file
 
 
-def process_video_two_pass(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", detection_skip=1, fade_in_sec=0.0, fade_out_sec=0.0, progress_offset=0, progress_scale=100):
+def process_video_two_pass(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", detection_skip=1, fade_in_sec=0.0, fade_out_sec=0.0, mask_mode="florence", progress_offset=0, progress_scale=100):
     """
     Two-pass video processing with frame skip detection and fade in/out handling.
 
@@ -479,7 +729,11 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),
                 "-i", str(input_path),
-                "-c:v", "copy",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 "-c:a", "aac",
                 "-map", "0:v:0",
                 "-map", "1:a:0",
@@ -503,7 +757,7 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     return output_file
 
 
-def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt="watermark", detection_skip=1, fade_in=0.0, fade_out=0.0, progress_offset=0, progress_scale=100):
+def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt="watermark", detection_skip=1, fade_in=0.0, fade_out=0.0, mask_mode="florence", progress_offset=0, progress_scale=100):
     # SAFETY: Never overwrite the input file
     if image_path.resolve() == output_path.resolve():
         logger.error(f"Cannot overwrite input file: {image_path}. Choose a different output path.")
@@ -519,16 +773,25 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         # Use two-pass if detection_skip > 1 or fade handling is needed
         use_two_pass = detection_skip > 1 or fade_in > 0 or fade_out > 0
         if use_two_pass:
-            return process_video_two_pass(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
+            if mask_mode == "heygen":
+                logger.warning("HeyGen mask mode processes videos frame-by-frame; detection skip and fade settings are ignored.")
+                return process_video(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, mask_mode, progress_offset, progress_scale)
+            return process_video_two_pass(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, detection_skip, fade_in, fade_out, mask_mode, progress_offset, progress_scale)
         else:
-            return process_video(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, progress_offset, progress_scale)
+            return process_video(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, mask_mode, progress_offset, progress_scale)
 
     # Process image
     image = Image.open(image_path).convert("RGB")
-    mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+    heygen_mask = None
+    heygen_alpha = None
+    if mask_mode == "heygen":
+        heygen_mask, heygen_alpha = build_heygen_template_maps(image)
+    mask_image = get_mask(image, mask_mode, florence_model, florence_processor, device, max_bbox_percent, detection_prompt, heygen_mask)
 
     if transparent:
         result_image = make_region_transparent(image, mask_image)
+    elif mask_mode == "heygen":
+        result_image = remove_heygen_watermark(image, heygen_alpha, heygen_mask)
     else:
         lama_result = process_image_with_lama(np.array(image), np.array(mask_image), model_manager)
         result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
@@ -567,10 +830,11 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
 @click.option("--max-bbox-percent", default=10.0, help="Maximum percentage of the image that a bounding box can cover.")
 @click.option("--force-format", type=click.Choice(["PNG", "WEBP", "JPG", "MP4", "AVI"], case_sensitive=False), default=None, help="Force output format. Defaults to input format.")
 @click.option("--detection-prompt", default="watermark", help="Text prompt for watermark detection (e.g. 'watermark', 'watermark Sora logo', 'Getty Images').")
+@click.option("--mask-mode", type=click.Choice(["florence", "heygen"], case_sensitive=False), default="florence", help="Mask generation mode. 'heygen' uses an OpenCV mask for repeated translucent HeyGen watermarks.")
 @click.option("--detection-skip", default=1, type=int, help="Detect watermarks every N frames for videos (1-10). Higher = faster but may miss brief watermarks.")
 @click.option("--fade-in", default=0.0, type=float, help="Extend mask backwards by N seconds to handle fade-in watermarks.")
 @click.option("--fade-out", default=0.0, type=float, help="Extend mask forwards by N seconds to handle fade-out watermarks.")
-def main(input_path: str, output_path: str, preview: bool, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, detection_prompt: str, detection_skip: int, fade_in: float, fade_out: float):
+def main(input_path: str, output_path: str, preview: bool, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, detection_prompt: str, mask_mode: str, detection_skip: int, fade_in: float, fade_out: float):
     # Input validation
     if detection_skip < 1 or detection_skip > 10:
         logger.warning(f"detection_skip must be 1-10, got {detection_skip}. Using 1.")
@@ -581,6 +845,10 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
         fade_out = 0
 
     input_path = Path(input_path)
+    mask_mode = mask_mode.lower()
+    if mask_mode not in {"florence", "heygen"}:
+        logger.warning(f"Unknown mask mode '{mask_mode}'. Using florence.")
+        mask_mode = "florence"
 
     # ========== PREVIEW MODE ==========
     if preview:
@@ -588,17 +856,6 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
         import base64
         from io import BytesIO
         import random
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Force no dtype for CUDA (intentional default)
-        # Apply float32 for CPU (compatibility)
-        model_dtype = torch.float32 if device == "cpu" else None
-
-        florence_model = Florence2ForConditionalGeneration.from_pretrained(
-            "florence-community/Florence-2-large",
-            torch_dtype=model_dtype).to(device).eval()
-        florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
 
         # Get sample image from input
         if input_path.is_dir():
@@ -632,18 +889,32 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             source_type = "image"
             source_frame = None
 
-        # Run detection
-        detections = detect_only(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+        if mask_mode == "heygen":
+            pil_image, detections = preview_heygen_mask(pil_image)
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Draw bounding boxes on image
-        draw = ImageDraw.Draw(pil_image)
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            color = (0, 255, 0) if det["accepted"] else (255, 0, 0)  # Green if accepted, red if rejected
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            # Draw label
-            label = f"{det['area_percent']:.1f}%"
-            draw.text((x1, y1 - 15), label, fill=color)
+            # Force no dtype for CUDA (intentional default)
+            # Apply float32 for CPU (compatibility)
+            model_dtype = torch.float32 if device == "cpu" else None
+
+            florence_model = Florence2ForConditionalGeneration.from_pretrained(
+                "florence-community/Florence-2-large",
+                torch_dtype=model_dtype).to(device).eval()
+            florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
+
+            # Run detection
+            detections = detect_only(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+
+            # Draw bounding boxes on image
+            draw = ImageDraw.Draw(pil_image)
+            for det in detections:
+                x1, y1, x2, y2 = det["bbox"]
+                color = (0, 255, 0) if det["accepted"] else (255, 0, 0)  # Green if accepted, red if rejected
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                # Draw label
+                label = f"{det['area_percent']:.1f}%"
+                draw.text((x1, y1 - 15), label, fill=color)
 
         # Convert to base64
         buffer = BytesIO()
@@ -658,7 +929,8 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             "source_type": source_type,
             "source_frame": source_frame,
             "prompt_used": detection_prompt,
-            "max_bbox_percent": max_bbox_percent
+            "max_bbox_percent": max_bbox_percent,
+            "mask_mode": mask_mode
         }
         print(json.dumps(result))
         return
@@ -673,13 +945,18 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
     # Apply float32 for CPU (compatibility)
     model_dtype = torch.float32 if device == "cpu" else None
 
-    florence_model = Florence2ForConditionalGeneration.from_pretrained(
-        "florence-community/Florence-2-large",
-        torch_dtype=model_dtype).to(device).eval()
-    florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
-    logger.info("Florence-2 Model loaded")
+    if mask_mode == "heygen":
+        florence_model = None
+        florence_processor = None
+        logger.info("HeyGen mask mode enabled; skipping Florence-2 model load")
+    else:
+        florence_model = Florence2ForConditionalGeneration.from_pretrained(
+            "florence-community/Florence-2-large",
+            torch_dtype=model_dtype).to(device).eval()
+        florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
+        logger.info("Florence-2 Model loaded")
 
-    if not transparent:
+    if not transparent and mask_mode != "heygen":
         model_manager = load_lama_model(device)
         logger.info("LaMa model loaded")
     else:
@@ -700,7 +977,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             # Calculate progress range for this file
             progress_offset = int(idx / total_files * 100)
             progress_scale = int(100 / total_files)
-            handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
+            handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, mask_mode, progress_offset, progress_scale)
     else:
         # Single file mode - if output is a directory, construct file path
         if output_path.is_dir():
@@ -715,7 +992,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             else:
                 output_file = output_file.with_suffix(".mp4")  # Default to mp4
 
-        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out)
+        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, mask_mode)
         print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
 
 if __name__ == "__main__":

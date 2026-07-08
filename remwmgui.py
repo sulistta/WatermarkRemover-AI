@@ -261,6 +261,9 @@ class Api:
 
         # Get settings
         detection_prompt = settings.get('detection_prompt', 'watermark')
+        mask_mode = settings.get('mask_mode', 'florence')
+        if mask_mode not in ('florence', 'heygen'):
+            mask_mode = 'florence'
         detection_skip = settings.get('detection_skip', 1)
         fade_in = settings.get('fade_in', 0)
         fade_out = settings.get('fade_out', 0)
@@ -275,6 +278,7 @@ class Api:
             'force_format': settings.get('format', 'None'),
             'mode': settings.get('mode', 'single'),
             'detection_prompt': detection_prompt,
+            'mask_mode': mask_mode,
             'detection_skip': detection_skip,
             'fade_in': fade_in,
             'fade_out': fade_out,
@@ -293,6 +297,7 @@ class Api:
 
         max_bbox = settings.get('max_bbox', 15)
         cmd.append(f'--max-bbox-percent={int(max_bbox)}')
+        cmd.append(f'--mask-mode={mask_mode}')
 
         format_opt = settings.get('format', 'None')
         if format_opt and format_opt != 'None':
@@ -424,6 +429,9 @@ class Api:
         """
         input_path = settings.get('input', '')
         detection_prompt = settings.get('detection_prompt', 'watermark')
+        mask_mode = settings.get('mask_mode', 'florence')
+        if mask_mode not in ('florence', 'heygen'):
+            mask_mode = 'florence'
         max_bbox = settings.get('max_bbox', 15)
 
         if not input_path:
@@ -435,7 +443,8 @@ class Api:
                 sys.executable, 'remwm.py',
                 input_path, '--preview',
                 '--max-bbox-percent', str(int(max_bbox)),
-                '--detection-prompt', detection_prompt
+                '--detection-prompt', detection_prompt,
+                '--mask-mode', mask_mode
             ]
 
             result = subprocess.run(

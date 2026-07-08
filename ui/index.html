@@ -209,8 +209,21 @@
                     </button>
                 </div>
 
+                <!-- Mask Mode -->
+                <div class="space-y-2">
+                    <label class="text-[10px] text-gray-500 uppercase cursor-help" x-text="t.settings?.mask_mode?.label || 'Mask Mode'"></label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <button @click="maskMode='florence'; saveConfigDebounced()" :class="maskMode=='florence' ? 'bg-neon-cyan text-black shadow-[0_0_12px_#00f3ff]' : 'bg-white/5 hover:bg-white/10 text-gray-400'" class="p-2 rounded-lg font-bold text-xs transition-all border border-white/10">
+                            Default
+                        </button>
+                        <button @click="maskMode='heygen'; saveConfigDebounced()" :class="maskMode=='heygen' ? 'bg-neon-pink text-black shadow-[0_0_12px_#ff00aa]' : 'bg-white/5 hover:bg-white/10 text-gray-400'" class="p-2 rounded-lg font-bold text-xs transition-all border border-white/10">
+                            HeyGen
+                        </button>
+                    </div>
+                </div>
+
                 <!-- Slider -->
-                <div class="space-y-2 pt-2">
+                <div class="space-y-2 pt-2" x-show="maskMode !== 'heygen'">
                     <div class="flex justify-between text-xs font-mono">
                         <span class="text-neon-cyan cursor-help" :data-tooltip="t.settings?.sigma_detect?.tooltip || ''" x-text="t.settings?.sigma_detect?.label || 'Max Size'"></span>
                         <span x-text="detection + '%'">10%</span>
@@ -223,7 +236,8 @@
                     <label class="text-[10px] text-gray-500 uppercase cursor-help" :data-tooltip="t.settings?.detection_prompt?.tooltip || ''" x-text="t.settings?.detection_prompt?.label || 'Detection Prompt'"></label>
                     <input type="text" x-model="detectionPrompt" list="prompt-suggestions" @change="saveConfigDebounced()"
                            :placeholder="t.settings?.detection_prompt?.placeholder || 'watermark'"
-                           class="w-full bg-black border border-white/20 text-white text-sm rounded-lg p-2.5 focus:border-neon-cyan outline-none font-mono">
+                           :disabled="maskMode === 'heygen'"
+                           class="w-full bg-black border border-white/20 text-white text-sm rounded-lg p-2.5 focus:border-neon-cyan outline-none font-mono disabled:opacity-40 disabled:cursor-not-allowed">
                     <datalist id="prompt-suggestions">
                         <option value="watermark">
                         <option value="watermark logo">
@@ -577,6 +591,7 @@
 
                 // Detection prompt
                 detectionPrompt: 'watermark',
+                maskMode: 'florence',
 
                 // Preview modal state
                 previewMode: false,
@@ -631,6 +646,7 @@
                             this.format = config.force_format || 'None';
                             this.mode = config.mode || 'single';
                             this.detectionPrompt = config.detection_prompt || 'watermark';
+                            this.maskMode = config.mask_mode || 'florence';
                             this.detectionSkip = config.detection_skip || 1;
                             this.fadeIn = config.fade_in || 0;
                             this.fadeOut = config.fade_out || 0;
@@ -834,6 +850,7 @@
                                 format: this.format,
                                 mode: this.mode,
                                 detection_prompt: this.detectionPrompt || 'watermark',
+                                mask_mode: this.maskMode || 'florence',
                                 // Video settings
                                 detection_skip: parseInt(this.detectionSkip) || 1,
                                 fade_in: parseFloat(this.fadeIn) || 0,
@@ -912,6 +929,7 @@
                             const result = await pywebview.api.preview_detection({
                                 input: this.inputPath,
                                 detection_prompt: this.detectionPrompt || 'watermark',
+                                mask_mode: this.maskMode || 'florence',
                                 max_bbox: this.detection
                             });
 
@@ -975,6 +993,7 @@
                         force_format: this.format,
                         mode: this.mode,
                         detection_prompt: this.detectionPrompt,
+                        mask_mode: this.maskMode,
                         // Video settings
                         detection_skip: parseInt(this.detectionSkip) || 1,
                         fade_in: parseFloat(this.fadeIn) || 0,
